@@ -48,6 +48,12 @@ class Settings(BaseSettings):
 
     max_concurrent_video_jobs: int = Field(default=3, alias="MAX_CONCURRENT_VIDEO_JOBS")
     max_concurrent_audio_jobs: int = Field(default=10, alias="MAX_CONCURRENT_AUDIO_JOBS")
+    max_download_items_per_request: int = Field(
+        default=10,
+        alias="MAX_DOWNLOAD_ITEMS_PER_REQUEST",
+        validation_alias=AliasChoices("MAX_DOWNLOAD_ITEMS_PER_REQUEST"),
+        ge=1,
+    )
 
     formats_daily_limit: int = Field(
         default=300,
@@ -222,22 +228,31 @@ class Settings(BaseSettings):
 
     @property
     def asset_dir_path(self) -> Path:
-        return (BASE_DIR / "asset").resolve()
+        return self._safe_project_path("asset")
 
     @property
+    def yt_dlp_path(self) -> Path:
+        return self.asset_dir_path / "yt-dlp"
+
+    @property
+    def ffmpeg_path(self) -> Path:
+        return self.asset_dir_path / "ffmpeg"
+
+    @property
+    def ffprobe_path(self) -> Path:
+        return self.asset_dir_path / "ffprobe"
+
     def allowed_ip_networks(self) -> list[ipaddress._BaseNetwork]:
         return [ipaddress.ip_network(item, strict=False) for item in self.allowed_ips]
 
-    @property
     def trusted_proxy_networks(self) -> list[ipaddress._BaseNetwork]:
         return [ipaddress.ip_network(item, strict=False) for item in self.trusted_proxy_ips]
 
-    def _safe_project_path(self, relative_or_abs: str) -> Path:
-        candidate = Path(relative_or_abs)
-        resolved = candidate.resolve() if candidate.is_absolute() else (BASE_DIR / candidate).resolve()
-        if BASE_DIR not in resolved.parents and resolved != BASE_DIR:
-            raise ValueError(f"Path must remain under project root: {relative_or_abs}")
-        return resolved
+    def _safe_project_path(self, value: str) -> Path:
+        path = Path(value)
+        if path.is_absolute():
+            return path.resolve()
+        return (BASE_DIR / path).resolve()
 
 
 @lru_cache(maxsize=1)

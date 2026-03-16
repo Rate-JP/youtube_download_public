@@ -19,4 +19,9 @@ async def formats(
     service: YtDlpService = Depends(get_ytdlp_service),
 ):
     runtime_status.enforce_and_increment_formats()
-    return await service.get_formats(str(payload.url), payload.target_type)
+    return await service.get_formats(
+        str(payload.url),
+        payload.target_type,
+        playlist_start_index=payload.playlist_start_index,
+        playlist_end_index=payload.playlist_end_index,
+    )

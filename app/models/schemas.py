@@ -12,6 +12,18 @@ OutputFormat = Literal["mp4", "mp3", "m4a"]
 class FormatsRequest(BaseModel):
     url: HttpUrl
     target_type: TargetType = "auto"
+    playlist_start_index: int | None = Field(default=None, ge=1)
+    playlist_end_index: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_playlist_range(self) -> "FormatsRequest":
+        if (
+            self.playlist_start_index is not None
+            and self.playlist_end_index is not None
+            and self.playlist_end_index < self.playlist_start_index
+        ):
+            raise ValueError("playlist_end_index must be greater than or equal to playlist_start_index")
+        return self
 
 
 class DownloadItemRequest(BaseModel):

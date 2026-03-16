@@ -372,7 +372,7 @@ class YtDlpService:
         return any(marker in text for marker in markers)
 
     async def _run_json_command(self, args: list[str], *, player_client: str = "default") -> dict[str, Any]:
-        async def run_once(*, force_refresh: bool = False) -> tuple[int, str]:
+        async def run_once(*, force_refresh: bool = False) -> tuple[int, str, str]:
             await self.cookie_manager.ensure_ready(force_refresh=force_refresh)
 
             cmd = [
@@ -389,9 +389,12 @@ class YtDlpService:
                     *cmd,
                     cwd=str(BASE_DIR),
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=self.settings.request_timeout)
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=self.settings.request_timeout,
+                )
             except asyncio.TimeoutError as exc:
                 raise AppError(
                     status_code=504,
@@ -399,31 +402,53 @@ class YtDlpService:
                     message="yt-dlp がタイムアウトしました",
                 ) from exc
 
-            raw = stdout.decode("utf-8", errors="ignore").strip()
-            return proc.returncode, raw
+            stdout_text = stdout.decode("utf-8", errors="ignore").strip()
+            stderr_text = stderr.decode("utf-8", errors="ignore").strip()
+            return proc.returncode, stdout_text, stderr_text
 
-        returncode, raw = await run_once()
-        if returncode != 0 and self.settings.youtube_cookies_enabled and self._is_cookie_auth_error(raw):
+        def extract_json_payload(text: str) -> dict[str, Any] | None:
+            if not text:
+                return None
+            decoder = json.JSONDecoder()
+            for start in range(len(text)):
+                if text[start] not in "[{":
+                    continue
+                try:
+                    value, end = decoder.raw_decode(text[start:])
+                except json.JSONDecodeError:
+                    continue
+                trailing = text[start + end :].strip()
+                if trailing:
+                    continue
+                if isinstance(value, dict):
+                    return value
+            return None
+
+        returncode, stdout_text, stderr_text = await run_once()
+        combined_error_text = "\n".join(part for part in [stderr_text, stdout_text] if part).strip()
+        if returncode != 0 and self.settings.youtube_cookies_enabled and self._is_cookie_auth_error(combined_error_text):
             logger.warning("cookie-related yt-dlp metadata failure detected; forcing cookie refresh and retry")
-            returncode, raw = await run_once(force_refresh=True)
+            returncode, stdout_text, stderr_text = await run_once(force_refresh=True)
+            combined_error_text = "\n".join(part for part in [stderr_text, stdout_text] if part).strip()
 
         if returncode != 0:
             raise AppError(
                 status_code=502,
                 error_code="yt_dlp_failed",
                 message="yt-dlp の実行に失敗しました",
-                extras={"detail": raw[-4000:]},
+                extras={"detail": combined_error_text[-4000:]},
             )
 
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise AppError(
-                status_code=502,
-                error_code="yt_dlp_invalid_json",
-                message="yt-dlp のメタデータ解析に失敗しました",
-                extras={"detail": raw[-4000:]},
-            ) from exc
+        payload = extract_json_payload(stdout_text)
+        if payload is not None:
+            return payload
+
+        raise AppError(
+            status_code=502,
+            error_code="yt_dlp_invalid_json",
+            message="yt-dlp のメタデータ解析に失敗しました",
+            extras={"detail": (stdout_text or stderr_text)[-4000:]},
+        )
 
     def _base_metadata_args(self) -> list[str]:
         return [
@@ -459,9 +484,20 @@ class YtDlpService:
         assert last_exc is not None
         raise last_exc
 
-    async def fetch_playlist_overview(self, url: str) -> dict[str, Any]:
+    async def fetch_playlist_overview(
+        self,
+        url: str,
+        *,
+        playlist_start_index: int | None = None,
+        playlist_end_index: int | None = None,
+    ) -> dict[str, Any]:
         self.validate_youtube_url(url)
-        args = [*self._base_metadata_args(), "--yes-playlist", "--flat-playlist", url]
+        args = [*self._base_metadata_args(), "--yes-playlist", "--flat-playlist"]
+        if playlist_start_index is not None:
+            args.extend(["--playlist-start", str(playlist_start_index)])
+        if playlist_end_index is not None:
+            args.extend(["--playlist-end", str(playlist_end_index)])
+        args.append(url)
         return await self._run_json_command(args, player_client="default")
 
     def _format_upload_date(self, value: str | None) -> str | None:
@@ -677,14 +713,41 @@ class YtDlpService:
             "cookie_warning": self.cookie_manager.last_warning,
         }
 
-    async def get_formats(self, url: str, target_type: str) -> dict[str, Any]:
+    async def get_formats(
+        self,
+        url: str,
+        target_type: str,
+        *,
+        playlist_start_index: int | None = None,
+        playlist_end_index: int | None = None,
+    ) -> dict[str, Any]:
         resolved = self.resolve_target_type(url, target_type)
 
         if resolved == "video":
             info = await self.fetch_video_info(url)
             return self._build_video_response(info)
 
-        overview = await self.fetch_playlist_overview(url)
+        page_size = max(1, self.settings.playlist_max_items)
+        requested_start_index = playlist_start_index or 1
+
+        if playlist_end_index is not None and playlist_end_index < requested_start_index:
+            raise AppError(
+                status_code=400,
+                error_code="invalid_playlist_range",
+                message="playlist_end_index は playlist_start_index 以上で指定してください",
+            )
+
+        requested_end_index = playlist_end_index
+        if requested_end_index is None:
+            requested_end_index = requested_start_index + page_size - 1
+        else:
+            requested_end_index = min(requested_end_index, requested_start_index + page_size - 1)
+
+        overview = await self.fetch_playlist_overview(
+            url,
+            playlist_start_index=requested_start_index,
+            playlist_end_index=requested_end_index,
+        )
         playlist_id = overview.get("id") or self.extract_ids_from_url(url)[1]
         if not playlist_id:
             raise AppError(
@@ -698,27 +761,8 @@ class YtDlpService:
         accepted_count = 0
         rejected_count = 0
 
-        for pos, entry in enumerate(entries, start=1):
+        for pos, entry in enumerate(entries, start=requested_start_index):
             entry_id = entry.get("id")
-
-            if pos > self.settings.playlist_max_items:
-                processed_entries.append(
-                    {
-                        "index": pos,
-                        "video_id": entry_id,
-                        "title": entry.get("title"),
-                        "duration_seconds": entry.get("duration"),
-                        "thumbnail_url": None,
-                        "uploader": overview.get("uploader"),
-                        "upload_date": None,
-                        "is_downloadable": False,
-                        "reject_reason": "playlist_max_items_exceeded",
-                        "video_formats": [],
-                        "audio_formats": [],
-                    }
-                )
-                rejected_count += 1
-                continue
 
             if not entry_id:
                 processed_entries.append(
@@ -789,15 +833,32 @@ class YtDlpService:
                 if not self.settings.playlist_continue_on_error:
                     break
 
+        returned_count = len(processed_entries)
+        returned_start_index = processed_entries[0]["index"] if processed_entries else None
+        returned_end_index = processed_entries[-1]["index"] if processed_entries else None
+        chunk_limit = requested_end_index - requested_start_index + 1
+        has_more = returned_count == chunk_limit and chunk_limit == page_size
+
         return {
             "success": True,
             "resource_type": "playlist",
             "playlist_id": playlist_id,
             "playlist_title": overview.get("title"),
-            "playlist_count": len(entries),
+            "playlist_count": overview.get("playlist_count") or len(entries),
             "uploader": overview.get("uploader"),
             "accepted_count": accepted_count,
             "rejected_count": rejected_count,
+            "playlist_chunk": {
+                "start_index": requested_start_index,
+                "end_index": requested_end_index,
+                "page_size": page_size,
+                "returned_count": returned_count,
+                "returned_start_index": returned_start_index,
+                "returned_end_index": returned_end_index,
+                "has_more": has_more,
+                "next_start_index": (requested_end_index + 1) if has_more else None,
+                "next_end_index": (requested_end_index + page_size) if has_more else None,
+            },
             "entries": processed_entries,
             "cookie_warning": self.cookie_manager.last_warning,
         }
