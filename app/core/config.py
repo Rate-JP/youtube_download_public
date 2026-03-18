@@ -48,6 +48,15 @@ class Settings(BaseSettings):
 
     max_concurrent_video_jobs: int = Field(default=3, alias="MAX_CONCURRENT_VIDEO_JOBS")
     max_concurrent_audio_jobs: int = Field(default=10, alias="MAX_CONCURRENT_AUDIO_JOBS")
+    max_concurrent_youtube_info_jobs: int = Field(
+        default=2,
+        alias="MAX_CONCURRENT_YOUTUBE_INFO_JOBS",
+        validation_alias=AliasChoices(
+            "MAX_CONCURRENT_YOUTUBE_INFO_JOBS",
+            "MAX_CONCURRENT_VIDEO_FETCH_JOBS",
+        ),
+        ge=1,
+    )
     max_download_items_per_request: int = Field(
         default=10,
         alias="MAX_DOWNLOAD_ITEMS_PER_REQUEST",
@@ -242,9 +251,11 @@ class Settings(BaseSettings):
     def ffprobe_path(self) -> Path:
         return self.asset_dir_path / "ffprobe"
 
+    @property
     def allowed_ip_networks(self) -> list[ipaddress._BaseNetwork]:
         return [ipaddress.ip_network(item, strict=False) for item in self.allowed_ips]
 
+    @property
     def trusted_proxy_networks(self) -> list[ipaddress._BaseNetwork]:
         return [ipaddress.ip_network(item, strict=False) for item in self.trusted_proxy_ips]
 

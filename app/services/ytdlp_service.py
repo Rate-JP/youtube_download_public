@@ -5,6 +5,8 @@ import json
 import logging
 import math
 import re
+import threading
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -221,6 +223,42 @@ class YtDlpService:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.cookie_manager = CookieManager(settings)
+        self.youtube_info_semaphore = asyncio.Semaphore(settings.max_concurrent_youtube_info_jobs)
+        self._youtube_info_counts_lock = threading.Lock()
+        self._youtube_info_waiting_count = 0
+        self._youtube_info_running_count = 0
+
+    @asynccontextmanager
+    async def acquire_youtube_info_slot(self):
+        with self._youtube_info_counts_lock:
+            self._youtube_info_waiting_count += 1
+
+        try:
+            async with self.youtube_info_semaphore:
+                with self._youtube_info_counts_lock:
+                    self._youtube_info_waiting_count = max(0, self._youtube_info_waiting_count - 1)
+                    self._youtube_info_running_count += 1
+                try:
+                    yield
+                finally:
+                    with self._youtube_info_counts_lock:
+                        self._youtube_info_running_count = max(0, self._youtube_info_running_count - 1)
+        except Exception:
+            with self._youtube_info_counts_lock:
+                self._youtube_info_waiting_count = max(0, self._youtube_info_waiting_count - 1)
+            raise
+
+    def get_youtube_info_queue_counts(self) -> dict[str, int]:
+        with self._youtube_info_counts_lock:
+            waiting = self._youtube_info_waiting_count
+            running = self._youtube_info_running_count
+
+        return {
+            "youtube_info_processing_count": waiting + running,
+            "youtube_info_running_count": running,
+            "youtube_info_waiting_count": waiting,
+            "max_concurrent_youtube_info_jobs": self.settings.max_concurrent_youtube_info_jobs,
+        }
 
     @property
     def yt_dlp_path(self) -> Path:
@@ -241,6 +279,17 @@ class YtDlpService:
                 status_code=500,
                 error_code="ffmpeg_binary_not_found",
                 message=f"ffmpeg executable not found: {path}",
+            )
+        return path
+
+    @property
+    def ffprobe_path(self) -> Path:
+        path = resolve_binary(self.settings.asset_dir_path, "ffprobe", "ffprobe.exe")
+        if not path.exists():
+            raise AppError(
+                status_code=500,
+                error_code="ffprobe_binary_not_found",
+                message=f"ffprobe executable not found: {path}",
             )
         return path
 
@@ -468,18 +517,19 @@ class YtDlpService:
             "web_safari",
         ]
 
-        last_exc: AppError | None = None
-        for client in clients_to_try:
-            try:
-                logger.info("fetch_video_info retrying with player_client=%s", client)
-                return await self._run_json_command(args, player_client=client)
-            except AppError as exc:
-                last_exc = exc
-                detail = str(exc.extras.get("detail", "")) if exc.extras else ""
-                if exc.error_code == "yt_dlp_failed" and "Requested format is not available" in detail:
-                    logger.warning("metadata fetch failed with player_client=%s: %s", client, detail[-1000:])
-                    continue
-                raise
+        async with self.acquire_youtube_info_slot():
+            last_exc: AppError | None = None
+            for client in clients_to_try:
+                try:
+                    logger.info("fetch_video_info retrying with player_client=%s", client)
+                    return await self._run_json_command(args, player_client=client)
+                except AppError as exc:
+                    last_exc = exc
+                    detail = str(exc.extras.get("detail", "")) if exc.extras else ""
+                    if exc.error_code == "yt_dlp_failed" and "Requested format is not available" in detail:
+                        logger.warning("metadata fetch failed with player_client=%s: %s", client, detail[-1000:])
+                        continue
+                    raise
 
         assert last_exc is not None
         raise last_exc
@@ -498,7 +548,8 @@ class YtDlpService:
         if playlist_end_index is not None:
             args.extend(["--playlist-end", str(playlist_end_index)])
         args.append(url)
-        return await self._run_json_command(args, player_client="default")
+        async with self.acquire_youtube_info_slot():
+            return await self._run_json_command(args, player_client="default")
 
     def _format_upload_date(self, value: str | None) -> str | None:
         if not value or len(value) != 8 or not value.isdigit():
@@ -689,6 +740,14 @@ class YtDlpService:
             },
         ]
 
+    def _build_available_presets(self) -> dict[str, Any]:
+        return {
+            "video_qualities": ["2160p", "1440p", "1080p", "720p"],
+            "audio_formats": ["m4a", "mp3"],
+            "fallback_policy": ["nearest_lower"],
+            "preferred_container": ["mp4"],
+        }
+
     def _build_video_response(self, info: dict[str, Any]) -> dict[str, Any]:
         video_id = info.get("id")
         if not video_id:
@@ -708,9 +767,28 @@ class YtDlpService:
             "thumbnail_url": info.get("thumbnail"),
             "uploader": info.get("uploader"),
             "upload_date": self._format_upload_date(info.get("upload_date")),
-            "video_formats": self._build_video_formats(info),
-            "audio_formats": self._build_audio_formats(info),
+            "available_presets": self._build_available_presets(),
             "cookie_warning": self.cookie_manager.last_warning,
+        }
+
+    def _build_playlist_entry_from_overview(
+        self,
+        entry: dict[str, Any],
+        *,
+        index: int,
+        default_uploader: str | None,
+    ) -> dict[str, Any]:
+        entry_id = entry.get("id")
+        return {
+            "index": index,
+            "video_id": entry_id,
+            "title": entry.get("title"),
+            "duration_seconds": entry.get("duration"),
+            "thumbnail_url": entry.get("thumbnails", [{}])[0].get("url") if isinstance(entry.get("thumbnails"), list) and entry.get("thumbnails") else None,
+            "uploader": entry.get("uploader") or entry.get("channel") or default_uploader,
+            "upload_date": self._format_upload_date(entry.get("upload_date")),
+            "is_downloadable": bool(entry_id),
+            "reject_reason": None if entry_id else "playlist_entry_id_not_found",
         }
 
     async def get_formats(
@@ -757,81 +835,12 @@ class YtDlpService:
             )
 
         entries = overview.get("entries") or []
-        processed_entries: list[dict[str, Any]] = []
-        accepted_count = 0
-        rejected_count = 0
-
-        for pos, entry in enumerate(entries, start=requested_start_index):
-            entry_id = entry.get("id")
-
-            if not entry_id:
-                processed_entries.append(
-                    {
-                        "index": pos,
-                        "video_id": None,
-                        "title": entry.get("title"),
-                        "duration_seconds": entry.get("duration"),
-                        "thumbnail_url": None,
-                        "uploader": overview.get("uploader"),
-                        "upload_date": None,
-                        "is_downloadable": False,
-                        "reject_reason": "playlist_entry_id_not_found",
-                        "video_formats": [],
-                        "audio_formats": [],
-                    }
-                )
-                rejected_count += 1
-                continue
-
-            try:
-                video_info = await self.fetch_video_info(f"https://www.youtube.com/watch?v={entry_id}")
-                item = self._build_video_response(video_info)
-
-                entry_payload = {
-                    "index": pos,
-                    "video_id": item["video_id"],
-                    "title": item["title"],
-                    "duration_seconds": item["duration_seconds"],
-                    "thumbnail_url": item["thumbnail_url"],
-                    "uploader": item["uploader"],
-                    "upload_date": item["upload_date"],
-                    "is_downloadable": bool(
-                        any(v["selectable"] for v in item["video_formats"])
-                        or any(a["selectable"] for a in item["audio_formats"])
-                    ),
-                    "reject_reason": None,
-                    "video_formats": item["video_formats"],
-                    "audio_formats": item["audio_formats"],
-                }
-
-                if entry_payload["is_downloadable"]:
-                    accepted_count += 1
-                else:
-                    entry_payload["reject_reason"] = "no_selectable_format"
-                    rejected_count += 1
-
-                processed_entries.append(entry_payload)
-
-            except AppError as exc:
-                logger.warning("playlist entry rejected: %s", exc.message)
-                processed_entries.append(
-                    {
-                        "index": pos,
-                        "video_id": entry_id,
-                        "title": entry.get("title"),
-                        "duration_seconds": entry.get("duration"),
-                        "thumbnail_url": None,
-                        "uploader": overview.get("uploader"),
-                        "upload_date": None,
-                        "is_downloadable": False,
-                        "reject_reason": exc.error_code,
-                        "video_formats": [],
-                        "audio_formats": [],
-                    }
-                )
-                rejected_count += 1
-                if not self.settings.playlist_continue_on_error:
-                    break
+        processed_entries = [
+            self._build_playlist_entry_from_overview(entry, index=pos, default_uploader=overview.get("uploader"))
+            for pos, entry in enumerate(entries, start=requested_start_index)
+        ]
+        accepted_count = sum(1 for item in processed_entries if item["is_downloadable"])
+        rejected_count = len(processed_entries) - accepted_count
 
         returned_count = len(processed_entries)
         returned_start_index = processed_entries[0]["index"] if processed_entries else None
@@ -848,6 +857,7 @@ class YtDlpService:
             "uploader": overview.get("uploader"),
             "accepted_count": accepted_count,
             "rejected_count": rejected_count,
+            "available_presets": self._build_available_presets(),
             "playlist_chunk": {
                 "start_index": requested_start_index,
                 "end_index": requested_end_index,
@@ -876,7 +886,7 @@ class YtDlpService:
         resource = self._build_video_response(info)
 
         if resource["duration_seconds"]:
-            if item.format == "mp4" and resource["duration_seconds"] > self.settings.max_duration_seconds_mp4:
+            if item.media_type == "video" and resource["duration_seconds"] > self.settings.max_duration_seconds_mp4:
                 raise AppError(
                     status_code=400,
                     error_code="duration_limit_exceeded",
@@ -888,7 +898,7 @@ class YtDlpService:
                     },
                 )
 
-            if item.format in {"mp3", "m4a"} and resource["duration_seconds"] > self.settings.max_duration_seconds_mp3:
+            if item.media_type == "audio" and resource["duration_seconds"] > self.settings.max_duration_seconds_mp3:
                 raise AppError(
                     status_code=400,
                     error_code="duration_limit_exceeded",
@@ -900,28 +910,23 @@ class YtDlpService:
                     },
                 )
 
-        if item.format == "mp4":
-            matched = next((fmt for fmt in resource["video_formats"] if fmt["format_id"] == item.format_id), None)
-            if not matched:
-                raise AppError(
-                    status_code=400,
-                    error_code="invalid_format_id",
-                    message="指定された mp4 format_id が無効です",
-                )
-            if not matched["selectable"]:
-                raise AppError(
-                    status_code=400,
-                    error_code=matched["reject_reason"] or "format_not_selectable",
-                    message="指定された mp4 フォーマットは選択できません",
-                )
-        else:
-            audio_item = next((fmt for fmt in resource["audio_formats"] if fmt["format"] == item.format), None)
-            if not audio_item or not audio_item["selectable"]:
-                raise AppError(
-                    status_code=400,
-                    error_code=(audio_item or {}).get("reject_reason") or "audio_format_not_selectable",
-                    message="指定された音声フォーマットは選択できません",
-                )
+        formats = info.get("formats") or []
+        has_video_source = any((fmt.get("vcodec") or "none") != "none" for fmt in formats)
+        has_audio_source = any((fmt.get("acodec") or "none") != "none" for fmt in formats)
+
+        if item.media_type == "video" and not has_video_source:
+            raise AppError(
+                status_code=400,
+                error_code="video_source_not_found",
+                message="動画ソースが見つかりません",
+            )
+
+        if item.media_type == "audio" and not has_audio_source:
+            raise AppError(
+                status_code=400,
+                error_code="audio_source_not_found",
+                message="音声ソースが見つかりません",
+            )
 
         return VideoContext(
             video_id=video_id,
@@ -937,14 +942,25 @@ class YtDlpService:
             resource_type=item.target_type,
             raw_info=info,
         )
+    def build_progress_key(
+        self,
+        video_id: str,
+        media_type: str,
+        quality: str | None,
+        audio_format: str | None,
+    ) -> str:
+        if media_type == "video":
+            return f"{video_id}_video_{quality or 'unknown'}_{audio_format or 'm4a'}"
+        return f"{video_id}_audio_{audio_format or 'unknown'}"
 
-    def build_progress_key(self, video_id: str, output_format: str, format_id: str | None) -> str:
-        selector = format_id if output_format == "mp4" else "audio"
-        return f"{video_id}:{output_format}:{selector}"
-
-    def build_output_paths(self, ctx: VideoContext, output_format: str, format_id: str | None) -> tuple[Path, Path | None]:
-        title_with_ext = f"{ctx.sanitized_title}.{output_format}"
-
+    def build_output_paths(
+        self,
+        ctx: VideoContext,
+        media_type: str,
+        quality: str | None,
+        audio_format: str | None,
+        preferred_container: str | None,
+    ) -> tuple[Path, Path | None]:
         if ctx.playlist_id and ctx.index is not None:
             base_dir = (
                 self.settings.playlist_save_root_path
@@ -954,47 +970,87 @@ class YtDlpService:
         else:
             base_dir = self.settings.download_root_path / sanitize_component(ctx.video_id)
 
-        if output_format == "mp4":
-            selector_dir = base_dir / f"mp4_{sanitize_component(format_id or 'best')}"
-            final_path = selector_dir / title_with_ext
-        else:
-            selector_dir = base_dir
-            final_path = selector_dir / title_with_ext
+        if media_type == "video":
+            selector_dir = base_dir / f"video_{sanitize_component(quality or 'best')}_{sanitize_component(preferred_container or 'mp4')}"
+            final_path = selector_dir / f"{ctx.sanitized_title}.{preferred_container or 'mp4'}"
+            temp_base = selector_dir / f"{ctx.sanitized_title}.downloaded"
+            return final_path, temp_base
 
-        temp_audio = None
-        if output_format == "mp3":
-            temp_audio = selector_dir / f"{ctx.sanitized_title}.source.m4a"
+        selector_dir = base_dir / f"audio_{sanitize_component(audio_format or 'best')}"
+        final_path = selector_dir / f"{ctx.sanitized_title}.{audio_format or 'm4a'}"
+        temp_base = selector_dir / f"{ctx.sanitized_title}.source"
+        return final_path, temp_base
 
-        return final_path, temp_audio
+    def _quality_to_height(self, quality: str) -> int:
+        mapping = {
+            "2160p": 2160,
+            "1440p": 1440,
+            "1080p": 1080,
+            "720p": 720,
+        }
+        if quality not in mapping:
+            raise AppError(
+                status_code=400,
+                error_code="invalid_quality",
+                message="未対応の画質です",
+            )
+        return mapping[quality]
 
-    async def download_item(self, *, ctx: VideoContext, output_format: str, format_id: str | None, progress_cb) -> Path:
-        final_path, temp_audio_path = self.build_output_paths(ctx, output_format, format_id)
+    def _height_to_quality_label(self, height: int | None) -> str | None:
+        if height is None or height <= 0:
+            return None
+        if height in {2160, 1440, 1080, 720}:
+            return f"{height}p"
+        return f"{height}p"
+
+    def _video_selector_for_quality(self, quality: str) -> str:
+        height = self._quality_to_height(quality)
+        return f"bv*[height<=?{height}]+ba/b[height<=?{height}]"
+
+    def _video_sort_order(self) -> str:
+        return "res,ext:mp4:m4a"
+
+    def _audio_selector(self) -> str:
+        return "bestaudio/best"
+
+    def _audio_sort_order(self) -> str:
+        return "ext:m4a"
+
+    def _output_template_for_base(self, base_path: Path) -> str:
+        return str(base_path.parent / f"{base_path.name}.%(ext)s")
+
+    def _find_downloaded_artifact(self, base_path: Path) -> Path | None:
+        candidates = sorted(base_path.parent.glob(f"{base_path.name}.*"))
+        ignore_suffixes = {".part", ".ytdl", ".json", ".info.json", ".description", ".jpg", ".png", ".webp"}
+        filtered = [p for p in candidates if p.suffix.lower() not in ignore_suffixes]
+        if not filtered:
+            return None
+        filtered.sort(key=lambda p: (p.suffix.lower() != ".mp4", p.suffix.lower() != ".m4a", p.name))
+        return filtered[0]
+
+    async def download_item(self, *, ctx: VideoContext, item: DownloadItemRequest, progress_cb) -> Path:
+        final_path, temp_base = self.build_output_paths(
+            ctx,
+            item.media_type,
+            item.quality,
+            item.audio_format,
+            item.preferred_container,
+        )
         ensure_directory(final_path.parent)
 
         if final_path.exists():
             return final_path
 
-        if output_format == "mp4":
-            await self._download_mp4(ctx, format_id or self._mp4_fallback_selector(), final_path, progress_cb)
+        if item.media_type == "video":
+            assert item.quality is not None
+            assert temp_base is not None
+            await self._download_video(ctx, item.quality, final_path, temp_base, progress_cb)
             return final_path
 
-        if output_format == "m4a":
-            await self._download_m4a(ctx, final_path, progress_cb)
-            return final_path
-
-        if output_format == "mp3":
-            assert temp_audio_path is not None
-            await self._download_m4a(ctx, temp_audio_path, progress_cb)
-            await self._convert_to_mp3(temp_audio_path, final_path, ctx.duration_seconds, progress_cb)
-            if temp_audio_path.exists():
-                temp_audio_path.unlink(missing_ok=True)
-            return final_path
-
-        raise AppError(
-            status_code=400,
-            error_code="unsupported_format",
-            message="未対応のフォーマットです",
-        )
+        assert item.audio_format is not None
+        assert temp_base is not None
+        await self._download_audio(ctx, item.audio_format, final_path, temp_base, progress_cb)
+        return final_path
 
     async def _run_download_process(
         self,
@@ -1050,30 +1106,6 @@ class YtDlpService:
 
         return output
 
-    async def _parse_progress_line(self, line: str, progress_cb, converting_on_keywords: tuple[str, ...]) -> None:
-        if line.startswith("download:"):
-            payload = line.split("download:", 1)[1]
-            match = PROGRESS_LINE_RE.match(payload)
-            if match:
-                downloaded = self._int_or_none(match.group("downloaded")) or 0
-                total = self._int_or_none(match.group("total")) or self._int_or_none(match.group("estimated"))
-                percent = self._float_percent_or_none(match.group("percent"))
-                if percent is None and total:
-                    percent = round(downloaded / total * 100, 2)
-
-                await progress_cb(
-                    status="downloading",
-                    progress_percent=percent or 0.0,
-                    downloaded_bytes=downloaded,
-                    total_bytes=total,
-                    message="ダウンロード中",
-                )
-                return
-
-        lower = line.lower()
-        if any(keyword.lower() in lower for keyword in converting_on_keywords):
-            await progress_cb(status="converting", progress_percent=95.0, message="変換中")
-
     @staticmethod
     def _int_or_none(value: str | None) -> int | None:
         if value is None:
@@ -1096,79 +1128,44 @@ class YtDlpService:
         except ValueError:
             return None
 
-    async def _download_mp4(self, ctx: VideoContext, format_id: str, final_path: Path, progress_cb) -> None:
+    async def _parse_progress_line(self, line: str, progress_cb, converting_on_keywords: tuple[str, ...]) -> None:
+        if line.startswith("download:"):
+            payload = line.split("download:", 1)[1]
+            match = PROGRESS_LINE_RE.match(payload)
+            if match:
+                downloaded = self._int_or_none(match.group("downloaded")) or 0
+                total = self._int_or_none(match.group("total")) or self._int_or_none(match.group("estimated"))
+                percent = self._float_percent_or_none(match.group("percent"))
+                if percent is None and total:
+                    percent = round(downloaded / total * 100, 2)
+
+                await progress_cb(
+                    status="downloading",
+                    progress_percent=percent or 0.0,
+                    downloaded_bytes=downloaded,
+                    total_bytes=total,
+                    message="ダウンロード中",
+                )
+                return
+
+        lower = line.lower()
+        if any(keyword.lower() in lower for keyword in converting_on_keywords):
+            await progress_cb(status="postprocessing", progress_percent=95.0, message="後処理中")
+
+    async def _download_video(
+        self,
+        ctx: VideoContext,
+        quality: str,
+        final_path: Path,
+        temp_base: Path,
+        progress_cb,
+    ) -> None:
         await self.cookie_manager.ensure_ready()
-
-        source_url = ctx.source_url if ctx.resource_type == "video" else f"https://www.youtube.com/watch?v={ctx.video_id}"
-        selector = format_id or self._mp4_fallback_selector()
-
-        async def run_with_selector(current_selector: str) -> str:
-            async def run_once(*, force_refresh: bool = False) -> str:
-                if force_refresh:
-                    await self.cookie_manager.ensure_ready(force_refresh=True)
-                cmd = [
-                    str(self.yt_dlp_path),
-                    "--ignore-config",
-                    *self._youtube_extractor_args("default"),
-                    "--no-playlist",
-                    "--newline",
-                    "--progress",
-                    "--progress-template",
-                    "download:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress._percent_str)s|%(progress.status)s",
-                    "--ffmpeg-location",
-                    str(self.ffmpeg_path),
-                    "--merge-output-format",
-                    "mp4",
-                    "-f",
-                    current_selector,
-                    "-o",
-                    str(final_path.with_suffix(".%(ext)s")),
-                    source_url,
-                    *self._build_cookie_args(),
-                ]
-                return await self._run_download_process(cmd, progress_cb, converting_on_keywords=("merger",))
-
-            try:
-                return await run_once()
-            except AppError as exc:
-                detail = str(exc.extras.get("detail", "")) if exc.extras else ""
-                if exc.error_code == "download_process_failed" and self._is_cookie_auth_error(detail):
-                    logger.warning("cookie-related yt-dlp download failure detected; forcing cookie refresh and retry")
-                    return await run_once(force_refresh=True)
-                raise
-
-        try:
-            await run_with_selector(selector)
-        except AppError as exc:
-            detail = str(exc.extras.get("detail", "")) if exc.extras else ""
-            if exc.error_code == "download_process_failed" and "Requested format is not available" in detail:
-                fallback = self._mp4_fallback_selector()
-                if selector != fallback:
-                    logger.warning("requested mp4 selector unavailable; retry with fallback selector: %s", fallback)
-                    await progress_cb(
-                        status="downloading",
-                        progress_percent=0.0,
-                        message="選択フォーマットが取得できないため自動フォールバックします",
-                    )
-                    await run_with_selector(fallback)
-                    return
-            raise
-
-    async def _download_m4a(self, ctx: VideoContext, final_path: Path, progress_cb) -> None:
-        best_audio = self._find_best_m4a_audio(ctx.raw_info)
-        if not best_audio:
-            raise AppError(
-                status_code=400,
-                error_code="audio_source_not_found",
-                message="m4a 音声ソースが見つかりません",
-            )
-
-        await self.cookie_manager.ensure_ready()
-
         source_url = f"https://www.youtube.com/watch?v={ctx.video_id}"
-        selector = self._m4a_selector()
+        selector = self._video_selector_for_quality(quality)
+        sort_order = self._video_sort_order()
 
-        def build_cmd(current_selector: str) -> list[str]:
+        def build_cmd() -> list[str]:
             return [
                 str(self.yt_dlp_path),
                 "--ignore-config",
@@ -1180,53 +1177,223 @@ class YtDlpService:
                 "download:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress._percent_str)s|%(progress.status)s",
                 "--ffmpeg-location",
                 str(self.ffmpeg_path),
+                "--format-sort",
+                sort_order,
+                "--merge-output-format",
+                "mp4",
                 "-f",
-                current_selector,
+                selector,
                 "-o",
-                str(final_path.with_suffix(".%(ext)s")),
+                self._output_template_for_base(temp_base),
                 source_url,
                 *self._build_cookie_args(),
             ]
 
-        async def run_cmd(current_selector: str, *, force_refresh: bool = False) -> None:
+        async def run_once(*, force_refresh: bool = False) -> None:
             if force_refresh:
                 await self.cookie_manager.ensure_ready(force_refresh=True)
-            await self._run_download_process(build_cmd(current_selector), progress_cb)
+            await self._run_download_process(build_cmd(), progress_cb, converting_on_keywords=("merger", "remux", "recode"))
 
         try:
-            await run_cmd(selector)
+            await run_once()
         except AppError as exc:
             detail = str(exc.extras.get("detail", "")) if exc.extras else ""
             if exc.error_code == "download_process_failed" and self._is_cookie_auth_error(detail):
-                logger.warning("cookie-related yt-dlp download failure detected; forcing cookie refresh and retry")
-                await run_cmd(selector, force_refresh=True)
-                return
-            if exc.error_code == "download_process_failed" and "Requested format is not available" in detail:
-                logger.warning("requested m4a selector unavailable; retry with bestaudio")
-                await progress_cb(
-                    status="downloading",
-                    progress_percent=0.0,
-                    message="選択音声が取得できないため自動フォールバックします",
-                )
-                try:
-                    await run_cmd("bestaudio/best")
-                except AppError as fallback_exc:
-                    fallback_detail = str(fallback_exc.extras.get("detail", "")) if fallback_exc.extras else ""
-                    if fallback_exc.error_code == "download_process_failed" and self._is_cookie_auth_error(fallback_detail):
-                        logger.warning("cookie-related yt-dlp fallback download failure detected; forcing cookie refresh and retry")
-                        await run_cmd("bestaudio/best", force_refresh=True)
-                        return
-                    raise
+                logger.warning("cookie-related yt-dlp video download failure detected; forcing cookie refresh and retry")
+                await run_once(force_refresh=True)
+            else:
+                raise
 
-        if final_path.suffix != ".m4a" and not final_path.exists():
-            for alt_ext in (".m4a", ".webm", ".m4b", ".mp4"):
-                alt = final_path.with_suffix(alt_ext)
-                if alt.exists() and alt != final_path:
-                    alt.replace(final_path)
-                    break
+        if final_path.exists():
+            return
+
+        source_path = self._find_downloaded_artifact(temp_base)
+        if source_path is None:
+            raise AppError(
+                status_code=502,
+                error_code="download_output_not_found",
+                message="ダウンロード後の動画ファイルが見つかりません",
+            )
+
+        await progress_cb(status="postprocessing", progress_percent=96.0, message="mp4 へ整形中")
+        await self._ensure_video_mp4(source_path, final_path)
+
+    async def _download_audio(
+        self,
+        ctx: VideoContext,
+        audio_format: str,
+        final_path: Path,
+        temp_base: Path,
+        progress_cb,
+    ) -> None:
+        await self.cookie_manager.ensure_ready()
+        source_url = f"https://www.youtube.com/watch?v={ctx.video_id}"
+
+        def build_cmd() -> list[str]:
+            return [
+                str(self.yt_dlp_path),
+                "--ignore-config",
+                *self._youtube_extractor_args("default"),
+                "--no-playlist",
+                "--newline",
+                "--progress",
+                "--progress-template",
+                "download:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress._percent_str)s|%(progress.status)s",
+                "--ffmpeg-location",
+                str(self.ffmpeg_path),
+                "--format-sort",
+                self._audio_sort_order(),
+                "-f",
+                self._audio_selector(),
+                "-o",
+                self._output_template_for_base(temp_base),
+                source_url,
+                *self._build_cookie_args(),
+            ]
+
+        async def run_once(*, force_refresh: bool = False) -> None:
+            if force_refresh:
+                await self.cookie_manager.ensure_ready(force_refresh=True)
+            await self._run_download_process(build_cmd(), progress_cb)
+
+        try:
+            await run_once()
+        except AppError as exc:
+            detail = str(exc.extras.get("detail", "")) if exc.extras else ""
+            if exc.error_code == "download_process_failed" and self._is_cookie_auth_error(detail):
+                logger.warning("cookie-related yt-dlp audio download failure detected; forcing cookie refresh and retry")
+                await run_once(force_refresh=True)
+            else:
+                raise
+
+        if final_path.exists():
+            return
+
+        source_path = self._find_downloaded_artifact(temp_base)
+        if source_path is None:
+            raise AppError(
+                status_code=502,
+                error_code="download_output_not_found",
+                message="ダウンロード後の音声ファイルが見つかりません",
+            )
+
+        if audio_format == "m4a":
+            if source_path.suffix.lower() == ".m4a":
+                source_path.replace(final_path)
+                return
+            await progress_cb(status="postprocessing", progress_percent=96.0, message="m4a へ変換中")
+            await self._convert_to_m4a(source_path, final_path)
+            return
+
+        await self._convert_to_mp3(source_path, final_path, ctx.duration_seconds, progress_cb)
+
+    async def _run_ffmpeg_command(self, cmd: list[str], *, timeout: int | None = None, error_code: str, message: str) -> bytes:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(BASE_DIR),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout or self.settings.request_timeout)
+        except asyncio.TimeoutError as exc:
+            raise AppError(
+                status_code=504,
+                error_code=f"{error_code}_timeout",
+                message=f"{message} がタイムアウトしました",
+            ) from exc
+
+        if proc.returncode != 0:
+            raise AppError(
+                status_code=502,
+                error_code=error_code,
+                message=f"{message} に失敗しました",
+                extras={"detail": stdout.decode("utf-8", errors="ignore")[-4000:]},
+            )
+        return stdout
+
+    async def _ensure_video_mp4(self, source_path: Path, final_path: Path) -> None:
+        if source_path.resolve() == final_path.resolve():
+            return
+        if source_path.suffix.lower() == ".mp4":
+            source_path.replace(final_path)
+            return
+
+        copy_cmd = [
+            str(self.ffmpeg_path),
+            "-y",
+            "-i",
+            str(source_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c",
+            "copy",
+            str(final_path),
+        ]
+        try:
+            await self._run_ffmpeg_command(
+                copy_cmd,
+                error_code="ffmpeg_video_remux_failed",
+                message="ffmpeg による mp4 リマックス",
+            )
+        except AppError:
+            transcode_cmd = [
+                str(self.ffmpeg_path),
+                "-y",
+                "-i",
+                str(source_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+                str(final_path),
+            ]
+            await self._run_ffmpeg_command(
+                transcode_cmd,
+                error_code="ffmpeg_video_transcode_failed",
+                message="ffmpeg による mp4 変換",
+            )
+
+        if source_path.exists() and source_path.resolve() != final_path.resolve():
+            source_path.unlink(missing_ok=True)
+
+    async def _convert_to_m4a(self, input_path: Path, output_path: Path) -> None:
+        cmd = [
+            str(self.ffmpeg_path),
+            "-y",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            str(output_path),
+        ]
+        await self._run_ffmpeg_command(
+            cmd,
+            error_code="ffmpeg_m4a_failed",
+            message="ffmpeg による m4a 変換",
+        )
+        if input_path.exists() and input_path.resolve() != output_path.resolve():
+            input_path.unlink(missing_ok=True)
 
     async def _convert_to_mp3(self, input_path: Path, output_path: Path, duration_seconds: int | None, progress_cb) -> None:
-        await progress_cb(status="converting", progress_percent=95.0, message="mp3 へ変換中")
+        await progress_cb(status="postprocessing", progress_percent=95.0, message="mp3 へ変換中")
 
         cmd = [
             str(self.ffmpeg_path),
@@ -1241,31 +1408,98 @@ class YtDlpService:
             str(output_path),
         ]
 
+        await self._run_ffmpeg_command(
+            cmd,
+            error_code="ffmpeg_failed",
+            message="ffmpeg による mp3 変換",
+        )
+
+        if input_path.exists() and input_path.resolve() != output_path.resolve():
+            input_path.unlink(missing_ok=True)
+
+        await progress_cb(
+            status="postprocessing",
+            progress_percent=99.0 if duration_seconds else 98.0,
+            message="mp3 変換完了処理中",
+        )
+
+    async def _probe_video_height(self, path: Path) -> int | None:
+        cmd = [
+            str(self.ffprobe_path),
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,height",
+            "-of",
+            "json",
+            str(path),
+        ]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=str(BASE_DIR),
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+                stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=self.settings.request_timeout)
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=self.settings.request_timeout)
         except asyncio.TimeoutError as exc:
             raise AppError(
                 status_code=504,
-                error_code="ffmpeg_timeout",
-                message="ffmpeg がタイムアウトしました",
+                error_code="ffprobe_timeout",
+                message="ffprobe がタイムアウトしました",
             ) from exc
 
         if proc.returncode != 0:
             raise AppError(
                 status_code=502,
-                error_code="ffmpeg_failed",
-                message="ffmpeg による mp3 変換に失敗しました",
-                extras={"detail": stdout.decode("utf-8", errors="ignore")[-4000:]},
+                error_code="ffprobe_failed",
+                message="ffprobe による画質確認に失敗しました",
             )
 
-        await progress_cb(
-            status="converting",
-            progress_percent=99.0 if duration_seconds else 98.0,
-            message="mp3 変換完了処理中",
-        )
+        payload = json.loads(stdout.decode("utf-8", errors="ignore") or "{}")
+        heights = [
+            int(stream.get("height"))
+            for stream in (payload.get("streams") or [])
+            if stream.get("codec_type") == "video" and stream.get("height")
+        ]
+        return max(heights) if heights else None
+
+    async def inspect_downloaded_video(
+        self,
+        path: Path,
+        requested_quality: str | None,
+        *,
+        raw_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            height = await self._probe_video_height(path)
+        except Exception:
+            logger.exception("failed to inspect downloaded video quality")
+            height = None
+        resolved_quality = self._height_to_quality_label(height)
+        quality_exact_match = None
+        fallback_reason = None
+        requested_quality_available: bool | None = None
+
+        if requested_quality and raw_info is not None:
+            target_height = self._quality_to_height(requested_quality)
+            requested_quality_available = any(
+                (fmt.get("vcodec") or "none") != "none" and int(fmt.get("height") or 0) == target_height
+                for fmt in (raw_info.get("formats") or [])
+            )
+
+        if requested_quality and resolved_quality:
+            quality_exact_match = resolved_quality == requested_quality
+            if not quality_exact_match:
+                if requested_quality_available is True:
+                    fallback_reason = "requested quality available but final output resolved to a different quality"
+                else:
+                    fallback_reason = "requested quality not available; downloaded nearest lower quality"
+        elif requested_quality and not resolved_quality:
+            fallback_reason = "requested quality could not be verified from downloaded file"
+
+        return {
+            "resolved_quality": resolved_quality,
+            "quality_exact_match": quality_exact_match,
+            "fallback_reason": fallback_reason,
+        }

@@ -113,10 +113,12 @@ RUN curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" -
     && mkdir -p /tmp/ffmpeg-extract \
     && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1 \
     && cp /tmp/ffmpeg-extract/ffmpeg /app/asset/ffmpeg \
-    && chmod +x /app/asset/ffmpeg \
+    && cp /tmp/ffmpeg-extract/ffprobe /app/asset/ffprobe \
+    && chmod +x /app/asset/ffmpeg /app/asset/ffprobe \
     && rm -rf /tmp/ffmpeg.tar.xz /tmp/ffmpeg-extract \
     && /app/asset/yt-dlp --version \
-    && /app/asset/ffmpeg -version | head -n 1
+    && /app/asset/ffmpeg -version | head -n 1 \
+    && /app/asset/ffprobe -version | head -n 1
 
 COPY app /app/app
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh

@@ -224,5 +224,6 @@ class RuntimeStatusService:
         return {
             "versions": self.get_versions(),
             "queue": self.job_manager.get_active_queue_counts(),
+            "youtube_info_queue": self.ytdlp_service.get_youtube_info_queue_counts(),
             "limits": self.get_limits_snapshot(),
         }

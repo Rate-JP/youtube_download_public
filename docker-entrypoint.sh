@@ -41,6 +41,11 @@ if [[ ! -x /app/asset/ffmpeg ]]; then
   exit 1
 fi
 
+if [[ ! -x /app/asset/ffprobe ]]; then
+  echo "[entrypoint] ffprobe not found: /app/asset/ffprobe" >&2
+  exit 1
+fi
+
 mkdir -p \
   /run/dbus \
   /var/run/xrdp \
@@ -215,6 +220,7 @@ echo "[entrypoint] Deno binary           : ${DENO_BINARY}"
 echo "[entrypoint] Deno version          : $(${DENO_BINARY} --version 2>/dev/null | head -n 1 || true)"
 echo "[entrypoint] yt-dlp version        : $(/app/asset/yt-dlp --version 2>/dev/null || true)"
 echo "[entrypoint] ffmpeg version        : $(/app/asset/ffmpeg -version 2>/dev/null | head -n 1 || true)"
+echo "[entrypoint] ffprobe version       : $(/app/asset/ffprobe -version 2>/dev/null | head -n 1 || true)"
 echo "[entrypoint] Chrome profile        : ${YOUTUBE_PROFILE_DIR}"
 echo "[entrypoint] Cookie export target  : ${YOUTUBE_COOKIE_FILE}"
 echo "[entrypoint] Remote debugging      : ${CHROME_REMOTE_DEBUGGING_HOST}:${CHROME_REMOTE_DEBUGGING_PORT}"

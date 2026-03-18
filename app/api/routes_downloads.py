@@ -40,4 +40,4 @@ async def download(
             },
         )
 
-    return await manager.enqueue_many(payload.items, runtime_status=runtime_status)
+    return await manager.enqueue_many(payload.to_item_requests(), runtime_status=runtime_status)
